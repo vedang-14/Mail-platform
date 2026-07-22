@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Trash2 } from "lucide-react";
 import { useMailbox } from "@/lib/mailboxContext";
 
+
 type Message = {
     id: string;
     from_name: string | null;

@@ -7,6 +7,7 @@ import { supabase } from "@/lib/supabase";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, Trash2 } from "lucide-react";
 import { toast } from "sonner";
+import { Attachments } from "@/components/Attachment";
 
 type Message = {
     id: string;

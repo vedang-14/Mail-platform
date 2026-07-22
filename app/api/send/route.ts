@@ -4,14 +4,21 @@ import { supabaseAdmin } from "@/lib/supabaseAdmin";
 import { checkSendRate } from "@/lib/ratelimit";
 
 /**
- * POST /api/send
- * Sends a message from ONE OF THE USER'S MAILBOXES.
+ * POST /api/send   (multipart/form-data)
+ * Sends a message from ONE OF THE USER'S MAILBOXES, with optional attachments.
  *
  * SECURITY — the From address is never taken from the client. The client sends a
- * mailbox_id; we verify that mailbox BELONGS TO THE AUTHENTICATED USER and then
- * derive the From address from the database row. Without that check, a user
- * could send mail as anyone's address.
+ * mailbox_id; we verify that mailbox BELONGS TO THE AUTHENTICATED USER and derive
+ * the From address from the database row. Without that check, a user could send
+ * mail as anyone's address.
+ *
+ * Attachments are uploaded to the private "attachments" bucket. Each recipient's
+ * copy gets its own attachment rows pointing at the SAME stored file, so local
+ * recipients can download it and the worker can attach it for external delivery.
  */
+
+const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024; // 25MB
+
 export async function POST(req: NextRequest) {
     // 1. Authenticate.
     const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
@@ -34,12 +41,19 @@ export async function POST(req: NextRequest) {
         );
     }
 
-    // 2. Validate input.
-    const body = await req.json().catch(() => ({}));
-    const mailboxId = String(body.mailbox_id ?? "").trim();
-    const toRaw = String(body.to ?? "").trim();
-    const subject = String(body.subject ?? "").trim();
-    const text = String(body.message ?? body.text ?? "");
+    // 2. Read multipart form (fields + files).
+    const form = await req.formData().catch(() => null);
+    if (!form) {
+        return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+    }
+
+    const mailboxId = String(form.get("mailbox_id") ?? "").trim();
+    const toRaw = String(form.get("to") ?? "").trim();
+    const subject = String(form.get("subject") ?? "").trim();
+    const text = String(form.get("message") ?? "");
+    const files = form
+        .getAll("attachments")
+        .filter((f): f is File => f instanceof File && f.size > 0);
 
     if (!toRaw || !subject || !text) {
         return NextResponse.json({ error: "All fields are required" }, { status: 400 });
@@ -49,6 +63,15 @@ export async function POST(req: NextRequest) {
     }
     if (text.length > 100_000) {
         return NextResponse.json({ error: "Message too long" }, { status: 400 });
+    }
+
+    // Server-side attachment cap — the client check is only a convenience.
+    const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+    if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+        return NextResponse.json(
+            { error: "Attachments exceed 25MB" },
+            { status: 400 }
+        );
     }
 
     const recipients = Array.from(
@@ -89,7 +112,6 @@ export async function POST(req: NextRequest) {
             );
         }
     } else {
-        // No mailbox specified — fall back to the user's primary.
         const { data } = await supabaseAdmin
             .from("mailboxes")
             .select("id, address")
@@ -106,7 +128,6 @@ export async function POST(req: NextRequest) {
         }
     }
 
-    // Display name from the profile.
     const { data: profile } = await supabaseAdmin
         .from("profiles")
         .select("username")
@@ -116,8 +137,7 @@ export async function POST(req: NextRequest) {
     const fromAddress = senderMailbox.address.toLowerCase();
     const mailDomain = fromAddress.split("@")[1];
 
-    // 4. Local vs external. "Local" = the address is a real mailbox on one of our
-    //    verified domains — not just "same domain as the sender".
+    // 4. Local vs external. "Local" = the address is a real mailbox of ours.
     const { data: localHits } = await supabaseAdmin
         .from("mailboxes")
         .select("id, address, user_id")
@@ -143,45 +163,114 @@ export async function POST(req: NextRequest) {
         message_id: messageId,
         provider: "webmail",
         provider_id: messageId,
+        has_attachments: files.length > 0,
     };
 
-    // 5. Sender's 'sent' copy, stamped with the mailbox it was sent from.
-    const { error: sentErr } = await supabaseAdmin.from("messages").insert({
-        owner_id: userId,
-        mailbox_id: senderMailbox.id,
-        direction: "outbound",
-        folder: "sent",
-        ...base,
-        is_read: true,
-        status: external.length ? "queued" : "sent",
-        next_attempt_at: external.length ? nowIso : null,
-        sent_at: nowIso,
-    });
+    // 5. Sender's 'sent' copy.
+    const { data: sentRow, error: sentErr } = await supabaseAdmin
+        .from("messages")
+        .insert({
+            owner_id: userId,
+            mailbox_id: senderMailbox.id,
+            direction: "outbound",
+            folder: "sent",
+            ...base,
+            is_read: true,
+            status: external.length ? "queued" : "sent",
+            next_attempt_at: external.length ? nowIso : null,
+            sent_at: nowIso,
+        })
+        .select("id")
+        .single();
+
     if (sentErr) {
         return NextResponse.json({ error: sentErr.message }, { status: 500 });
     }
 
-    // 6. Local delivery — an inbox copy for each local recipient, stamped with
-    //    THEIR mailbox. Each copy gets a distinct provider_id so it never
-    //    collides with the sender's 'sent' copy (or another recipient's copy) —
-    //    this matters when the sender and recipient are the SAME user (someone
-    //    emailing between their own mailboxes).
+    // 6. Upload attachments once, to a path shared by all copies of this message.
+    //    Each message copy then gets its own attachments row pointing at it.
+    type StoredFile = {
+        path: string;
+        filename: string;
+        contentType: string;
+        size: number;
+    };
+    const stored: StoredFile[] = [];
+
+    for (const file of files) {
+        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const path = `${userId}/${sentRow.id}/${safeName}`;
+        const bytes = Buffer.from(await file.arrayBuffer());
+
+        const { error: upErr } = await supabaseAdmin.storage
+            .from("attachments")
+            .upload(path, bytes, {
+                contentType: file.type || "application/octet-stream",
+                upsert: true,
+            });
+
+        if (upErr) {
+            console.error(`[send] attachment upload failed (${safeName}):`, upErr.message);
+            continue; // non-fatal — the message still sends
+        }
+
+        stored.push({
+            path,
+            filename: file.name,
+            contentType: file.type || "application/octet-stream",
+            size: file.size,
+        });
+    }
+
+    /** Link the stored files to one message copy. */
+    async function linkAttachments(messageRowId: string, ownerId: string) {
+        if (stored.length === 0) return;
+        const rows = stored.map((s) => ({
+            message_id: messageRowId,
+            owner_id: ownerId,
+            filename: s.filename,
+            content_type: s.contentType,
+            size_bytes: s.size,
+            storage_path: s.path,
+        }));
+        const { error } = await supabaseAdmin.from("attachments").insert(rows);
+        if (error) console.error("[send] attachment rows failed:", error.message);
+    }
+
+    await linkAttachments(sentRow.id, userId);
+
+    // 7. Local delivery — an inbox copy per local recipient, stamped with THEIR
+    //    mailbox. Distinct provider_id so a self-send doesn't collide with the
+    //    sender's own 'sent' copy.
     const delivered: string[] = [];
     for (const rcpt of local) {
         const target = localByAddress.get(rcpt);
         if (!target) continue;
 
-        const { error: inErr } = await supabaseAdmin.from("messages").insert({
-            owner_id: target.user_id,
-            mailbox_id: target.id,
-            direction: "inbound",
-            folder: "inbox",
-            ...base,
-            provider_id: `${messageId}:inbox:${target.id}`, // distinct — avoids dedup collision
-            received_at: nowIso,
-        });
-        if (!inErr) delivered.push(rcpt);
+        const { data: inRow, error: inErr } = await supabaseAdmin
+            .from("messages")
+            .insert({
+                owner_id: target.user_id,
+                mailbox_id: target.id,
+                direction: "inbound",
+                folder: "inbox",
+                ...base,
+                provider_id: `${messageId}:inbox:${target.id}`,
+                received_at: nowIso,
+            })
+            .select("id")
+            .single();
+
+        if (!inErr && inRow) {
+            await linkAttachments(inRow.id, target.user_id);
+            delivered.push(rcpt);
+        }
     }
 
-    return NextResponse.json({ ok: true, delivered, queued: external });
+    return NextResponse.json({
+        ok: true,
+        delivered,
+        queued: external,
+        attachments: stored.length,
+    });
 }
