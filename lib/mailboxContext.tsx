@@ -97,7 +97,9 @@ export function MailboxProvider({ children }: { children: React.ReactNode }) {
         if (typeof window !== "undefined") {
             window.localStorage.setItem(STORAGE_KEY, id);
         }
-    }, []);
+        // Re-pull mailboxes so unread badges reflect the new state.
+        refresh();
+    }, [refresh]);
 
     const active = mailboxes.find((m) => m.id === activeId) ?? null;
 
